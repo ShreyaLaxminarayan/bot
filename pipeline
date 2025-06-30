@@ -1,0 +1,142 @@
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'pr_number', defaultValue: '', description: 'PR number to build')
+    string(name: 'comment_user', defaultValue: '', description: 'User who called the bot')
+    string(name: 'head_branch', defaultValue: '', description: 'PR branch')
+    string(name: 'base_branch', defaultValue: '', description: 'Base branch')
+  }
+
+  environment {
+    REPO = 'ShreyaLaxminarayan/runtime'
+    GITHUB_TOKEN = credentials('GITHUB_TOKEN')
+    BUILD_URL = "${env.BUILD_URL}"
+  }
+
+  stages {
+    stage('Cleanup') {
+      steps {
+        cleanWs()
+      }
+    }
+
+    stage('Checkout Repo and Setup SDK') {
+      steps {
+        script {
+          writeFile file: 'build_and_setup.sh', text: '''#!/bin/bash
+set -e
+export DOTNET_RUNNING_IN_CONTAINER=true
+TARGET_BRANCH="${base_branch}"
+PR_BRANCH="${head_branch}"
+GITHUB_PR_NUMBER="${pr_number}"
+
+export GITHUB_TOKEN=${GITHUB_TOKEN}
+
+cd "$WORKSPACE"
+echo "Cloning repository..."
+git clone https://$GITHUB_TOKEN@github.com/${REPO}.git repo
+cd repo
+git config user.name "Dotnet-s390x"
+git config user.email "dotnet.s390x@gmail.com"
+
+echo "Target branch: $TARGET_BRANCH"
+echo "PR branch: $PR_BRANCH"
+echo "PR number: $GITHUB_PR_NUMBER"
+
+git fetch origin "$PR_BRANCH:$PR_BRANCH"
+git fetch origin "$TARGET_BRANCH"
+git checkout "$PR_BRANCH"
+
+if ! git merge "origin/$TARGET_BRANCH" --no-edit; then
+  gh pr comment "$GITHUB_PR_NUMBER" -R "$REPO" --body "Merge conflict detected. Please resolve conflicts manually."
+  exit 1
+fi
+
+gh pr comment "$GITHUB_PR_NUMBER" -R "$REPO" --body "Build starting on s390x..."
+
+mkdir -p "sdk"
+mkdir -p "packages"
+mkdir -p ".dotnet"
+
+version=$(jq -r .sdk.version "global.json")
+TARBALL_PATH="sdk/dotnet-sdk-${version}-linux-s390x.tar.gz"
+
+pushd "sdk"
+if gh release download "v${version}" --repo IBM/dotnet-s390x --pattern "dotnet-sdk-${version}-linux-s390x.tar.gz"; then
+  echo "SDK downloaded."
+else
+  echo "Failed to download dotnet SDK tarball. Ensure release v${version} exists."
+  gh pr comment "$GITHUB_PR_NUMBER" -R "$REPO" --body "Sorry! We could not find the SDK for version ${version}."
+  exit 1
+fi
+popd
+
+if tar -xzf "$TARBALL_PATH" --directory ".dotnet/"; then
+  echo "SDK extraction successful."
+else
+  echo "SDK extraction failed."
+  exit 1
+fi
+
+pushd "packages"
+if gh release download "v${version}" --repo IBM/dotnet-s390x --pattern '*linux-s390x*.nupkg'; then
+  echo "NuGet packages downloaded."
+else
+  echo "Failed to download NuGet packages. Build may continue without them."
+fi
+popd
+
+set +e
+LOG_FILE=$(mktemp)
+
+declare -a runtime_build_flags=(
+  --cmakeargs -DCLR_CMAKE_USE_SYSTEM_ZLIB=false
+  --portablebuild false
+  --runtimeconfiguration Release
+  --librariesConfiguration Debug
+  --warnAsError false
+  "/p:NoPgoOptimize=true"
+  "/p:UsingToolMicrosoftNetCompilers=true"
+  "/p:TreatWarningsAsErrors=false"
+  "/p:DotNetBuildFromSource=true"
+  "/p:DotNetBuildSourceOnly=true"
+  "/p:DotNetBuildTests=true"
+  "/p:PrimaryRuntimeFlavor=Mono"
+  "/p:TargetRid=linux-s390x"
+  --subset clr+mono+libs+host+packs+libs.tests
+  --test
+)
+
+echo "Build log at: $LOG_FILE"
+./build.sh "${runtime_build_flags[@]}" 2>&1 | tee "$LOG_FILE"
+
+logs="Please check the build logs: $BUILD_URL/console."
+
+if grep -iq "Build FAILED" "$LOG_FILE"; then
+    post_build_failed=$(awk '/Build FAILED/{flag=1} flag' "$LOG_FILE")
+    read -r -d '' comment_body <<EOF
+**Build Failed**
+$logs
+<details><summary>Build Error Summary</summary>
+$post_build_failed
+</details>
+EOF
+elif grep -iq "Build successful" "$LOG_FILE"; then
+  comment_body=" Build Successful!\n$logs"
+elif grep -iq "build aborted" "$LOG_FILE"; then
+  comment_body="️ Build Aborted.\n$logs"
+else
+  comment_body="$logs"
+fi
+
+gh pr comment "$GITHUB_PR_NUMBER" -R "$REPO" --body "$comment_body"
+'''
+
+          sh 'chmod +x build_and_setup.sh'
+          sh './build_and_setup.sh'
+        }
+      }
+    }
+  }
+}
